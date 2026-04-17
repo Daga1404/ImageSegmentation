@@ -67,9 +67,12 @@ YELLOW_H_MAX = 38
 HOUGH_THRESHOLD     = 30
 HOUGH_MIN_LEN       = 30
 HOUGH_MAX_GAP       = 100
-HOUGH_SLOPE_MIN     = 0.22
+HOUGH_SLOPE_MIN     = 0.40   # |pendiente| mínima — evita casi horizontales
+HOUGH_SLOPE_MAX     = 3.50   # |pendiente| máxima — evita casi verticales
 HOUGH_LEFT_MAX_MID  = 0.50
 HOUGH_RIGHT_MIN_MID = 0.50
+HOUGH_MIN_SEGMENTS  = 2      # mínimo segmentos para dibujar la línea
+HOUGH_SMOOTH_ALPHA  = 0.25   # EMA: 0=congelado, 1=sin suavizado
 
 BLOB_MIN_FRAC = 0.003
 OUTPUT_NAMES  = ("road", "lanes", "combined")
@@ -266,9 +269,26 @@ def detect_lane_lines(norm, road_mask, night_mode):
 
 
 # ---------------------------------------------------------------------------
-# HOUGH → 1 línea por lado
+# HOUGH → 1 línea por lado  (robusto)
 # ---------------------------------------------------------------------------
+
+# Estado de suavizado temporal (EMA) — persistente entre frames
+_lane_smooth = {"left": None, "right": None}   # (slope, intercept) suavizados
+
+
+def _iqr_filter(values):
+    """Elimina outliers fuera de [Q1 - 1.5·IQR, Q3 + 1.5·IQR]."""
+    if len(values) < 4:
+        return values
+    arr  = np.array(values)
+    q1, q3 = np.percentile(arr, 25), np.percentile(arr, 75)
+    iqr  = q3 - q1
+    mask = (arr >= q1 - 1.5 * iqr) & (arr <= q3 + 1.5 * iqr)
+    return arr[mask].tolist() if mask.sum() > 0 else values
+
+
 def _extrapolate(slope, intercept, h, w):
+    """Extrapola la línea entre y_bot y y_top con coordenadas clipeadas."""
     y_bot = h
     y_top = int(h * 0.57)
     if abs(slope) < 1e-5:
@@ -276,6 +296,20 @@ def _extrapolate(slope, intercept, h, w):
     x_bot = int(np.clip((y_bot - intercept) / slope, 0, w - 1))
     x_top = int(np.clip((y_top - intercept) / slope, 0, w - 1))
     return x_bot, y_bot, x_top, y_top
+
+
+def _smooth_lane(side, slope, intercept):
+    """Aplica EMA al par (slope, intercept) para suavizar entre frames."""
+    prev = _lane_smooth[side]
+    if prev is None:
+        _lane_smooth[side] = (slope, intercept)
+    else:
+        a = HOUGH_SMOOTH_ALPHA
+        _lane_smooth[side] = (
+            a * slope     + (1 - a) * prev[0],
+            a * intercept + (1 - a) * prev[1],
+        )
+    return _lane_smooth[side]
 
 
 def detect_hough_lines(binary, frame_shape):
@@ -287,33 +321,60 @@ def detect_hough_lines(binary, frame_shape):
         minLineLength=HOUGH_MIN_LEN,
         maxLineGap=HOUGH_MAX_GAP
     )
-    if lines is None:
-        return []
 
-    left_p, right_p = [], []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        if x2 == x1:
-            continue
-        slope     = (y2 - y1) / (x2 - x1)
-        intercept = y1 - slope * x1
-        mid_x     = (x1 + x2) / 2
-        if abs(slope) < HOUGH_SLOPE_MIN:
-            continue
-        if slope < 0 and mid_x < w * HOUGH_LEFT_MAX_MID:
-            left_p.append((slope, intercept))
-        elif slope > 0 and mid_x > w * HOUGH_RIGHT_MIN_MID:
-            right_p.append((slope, intercept))
+    left_slopes, left_ints   = [], []
+    right_slopes, right_ints = [], []
+
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 == x1:
+                continue
+            slope     = (y2 - y1) / (x2 - x1)
+            intercept = y1 - slope * x1
+            mid_x     = (x1 + x2) / 2
+            abs_slope = abs(slope)
+
+            # Filtrar pendientes fuera del rango de carriles reales
+            if abs_slope < HOUGH_SLOPE_MIN or abs_slope > HOUGH_SLOPE_MAX:
+                continue
+
+            if slope < 0 and mid_x < w * HOUGH_LEFT_MAX_MID:
+                left_slopes.append(slope)
+                left_ints.append(intercept)
+            elif slope > 0 and mid_x > w * HOUGH_RIGHT_MIN_MID:
+                right_slopes.append(slope)
+                right_ints.append(intercept)
 
     result = []
-    for params in [left_p, right_p]:
-        if not params:
+    for side, slopes, ints in [
+        ("left",  left_slopes,  left_ints),
+        ("right", right_slopes, right_ints),
+    ]:
+        # Necesita mínimo de segmentos para ser confiable
+        if len(slopes) < HOUGH_MIN_SEGMENTS:
+            # Usar el valor suavizado del frame anterior si existe
+            if _lane_smooth[side] is not None:
+                s, i = _lane_smooth[side]
+                seg  = _extrapolate(s, i, h, w)
+                if seg:
+                    result.append(seg)
             continue
-        med_s = float(np.median([p[0] for p in params]))
-        med_i = float(np.median([p[1] for p in params]))
-        seg   = _extrapolate(med_s, med_i, h, w)
+
+        # Filtrar outliers con IQR antes de calcular la mediana
+        slopes_f = _iqr_filter(slopes)
+        ints_f   = _iqr_filter(ints)
+
+        med_s = float(np.median(slopes_f))
+        med_i = float(np.median(ints_f))
+
+        # Aplicar suavizado temporal EMA
+        med_s, med_i = _smooth_lane(side, med_s, med_i)
+
+        seg = _extrapolate(med_s, med_i, h, w)
         if seg:
             result.append(seg)
+
     return result
 
 
@@ -384,6 +445,10 @@ def process_video(input_path, output_dir):
     roi_mask  = build_roi_mask(TARGET_SIZE[1], TARGET_SIZE[0])
     frame_idx = 0
     print(f"  {total} frames @ {fps:.1f} fps")
+
+    # Resetear suavizado temporal al inicio de cada video
+    _lane_smooth["left"]  = None
+    _lane_smooth["right"] = None
 
     while True:
         ret, frame = cap.read()
