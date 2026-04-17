@@ -312,7 +312,7 @@ def _smooth_lane(side, slope, intercept):
     return _lane_smooth[side]
 
 
-def detect_hough_lines(binary, frame_shape):
+def detect_hough_lines(binary, frame_shape, road_mask):
     h, w  = frame_shape[:2]
     edges = cv2.Canny(binary, 50, 150)
     lines = cv2.HoughLinesP(
@@ -335,9 +335,21 @@ def detect_hough_lines(binary, frame_shape):
             mid_x     = (x1 + x2) / 2
             abs_slope = abs(slope)
 
-            # Filtrar pendientes fuera del rango de carriles reales
             if abs_slope < HOUGH_SLOPE_MIN or abs_slope > HOUGH_SLOPE_MAX:
                 continue
+
+            # --- NUEVO: validar que el segmento esté sobre la carretera ---
+            # Muestrear ~12 puntos a lo largo del segmento y verificar
+            # que la mayoría caen dentro de road_mask.
+            n_pts    = 12
+            xs = np.linspace(x1, x2, n_pts).astype(int)
+            ys = np.linspace(y1, y2, n_pts).astype(int)
+            xs = np.clip(xs, 0, w - 1)
+            ys = np.clip(ys, 0, h - 1)
+            on_road  = road_mask[ys, xs].sum() / 255
+            if on_road / n_pts < 0.60:   # < 60 % del segmento sobre carretera → descartar
+                continue
+            # -----------------------------------------------------------
 
             if slope < 0 and mid_x < w * HOUGH_LEFT_MAX_MID:
                 left_slopes.append(slope)
@@ -351,9 +363,7 @@ def detect_hough_lines(binary, frame_shape):
         ("left",  left_slopes,  left_ints),
         ("right", right_slopes, right_ints),
     ]:
-        # Necesita mínimo de segmentos para ser confiable
         if len(slopes) < HOUGH_MIN_SEGMENTS:
-            # Usar el valor suavizado del frame anterior si existe
             if _lane_smooth[side] is not None:
                 s, i = _lane_smooth[side]
                 seg  = _extrapolate(s, i, h, w)
@@ -361,14 +371,12 @@ def detect_hough_lines(binary, frame_shape):
                     result.append(seg)
             continue
 
-        # Filtrar outliers con IQR antes de calcular la mediana
         slopes_f = _iqr_filter(slopes)
         ints_f   = _iqr_filter(ints)
 
         med_s = float(np.median(slopes_f))
         med_i = float(np.median(ints_f))
 
-        # Aplicar suavizado temporal EMA
         med_s, med_i = _smooth_lane(side, med_s, med_i)
 
         seg = _extrapolate(med_s, med_i, h, w)
@@ -461,7 +469,7 @@ def process_video(input_path, output_dir):
 
         road_mask                       = detect_road_surface(norm, roi_mask, night_mode)
         white_mask, yellow_mask, binary = detect_lane_lines(norm, road_mask, night_mode)
-        hough_lines                     = detect_hough_lines(binary, frame.shape)
+        hough_lines                     = detect_hough_lines(binary, frame.shape, road_mask)
 
         writers["road"].write(draw_road_only(frame, road_mask))
         writers["lanes"].write(draw_lanes_only(frame, white_mask, yellow_mask, hough_lines))
