@@ -1,40 +1,27 @@
 """
-Parte 2 — Detección de carretera, carriles y líneas de división  (v6.1)
-============================================================================
-CAMBIO FUNDAMENTAL respecto a v1-v5:
-  Las versiones anteriores usaban umbrales FIJOS de cromaticidad/textura
-  que fallaban en distintos tipos de carretera (asfalto oscuro, claro,
-  nocturno, desértico, agrietado). Cada ajuste para un video rompía otro.
+Parte 2 — Detección de carretera, carriles y líneas de división  (v7)
+======================================================================
+PROBLEMA RAÍZ de v1-v6:
+  Todos usaban umbrales GLOBALES por frame (L>200, S>70, etc.).
+  De noche una línea blanca tiene L=140 pero también el cielo y farolas.
+  Con vegetación, el pasto amarillo tiene el mismo rango H/S que las marcas.
 
-  v6 usa MUESTREO ADAPTIVO: en cada frame se muestrea el color real del
-  asfalto en varias zonas del centro-inferior y se construye el umbral a
-  partir de esa muestra. Funciona para cualquier tipo de carretera sin
-  cambiar parámetros.
+SOLUCIÓN v7 — DOS CAMBIOS FUNDAMENTALES:
 
-ARQUITECTURA v6:
-  ┌─────────────────────────────────────────────────────────┐
-  │  1. MUESTREO ADAPTIVO del color de carretera            │
-  │     · 3 parches en el centro-inferior del frame         │
-  │     · Mediana robusta → color de referencia             │
-  │     · Tolerancia dinámica por canal                     │
-  ├─────────────────────────────────────────────────────────┤
-  │  2. MÁSCARA DE CARRETERA                                │
-  │     · Píxeles dentro de tolerancia del color muestreado │
-  │     · ROI trapezoidal + exclusión de zona superior      │
-  │     · Closing morfológico grande (rellena sombras)      │
-  │     · Votación multi-semilla para selección de blob     │
-  ├─────────────────────────────────────────────────────────┤
-  │  3. LÍNEAS DE CARRIL (dentro de la máscara)             │
-  │     Blanco sólido/discontinuo: L > 200 en HLS           │
-  │     Amarillo sólido/discontinuo: H[15-38] + S > 70 HLS  │
-  │     Gradiente Sobel-X: detecta bordes de marcas viales  │
-  │     → Combinación de los 3 para máxima cobertura        │
-  ├─────────────────────────────────────────────────────────┤
-  │  4. HOUGH ROBUSTO                                       │
-  │     · Filtro de zona: izq < 48 %, der > 52 % de ancho  │
-  │       (evita que línea central se clasifique mal)       │
-  │     · Mediana de parámetros (robusta a outliers)        │
-  └─────────────────────────────────────────────────────────┘
+  ① DETECCIÓN DE LÍNEAS POR UMBRAL ADAPTIVO LOCAL (cv2.adaptiveThreshold)
+    Una marca vial SIEMPRE es más brillante que el asfalto inmediatamente
+    a su alrededor, sin importar la luz global del frame.
+    adaptiveThreshold compara cada píxel con su vecindad (bloque 61×61):
+      · Día:   línea blanca L=240 vs asfalto L=160 → diferencia +80  ✓
+      · Noche: línea blanca L=140 vs asfalto L= 60 → diferencia +80  ✓
+      · Vegetación fuera de road_mask → no llega a Hough              ✓
+    Esto captura blancas continuas, blancas discontinuas, amarillas
+    continuas y discontinuas con el mismo algoritmo, día y noche.
+
+  ② DETECCIÓN DE CARRETERA MÁS ROBUSTA DE NOCHE
+    De noche se sube la tolerancia de muestreo adaptivo y se aplica
+    un closing extra para unir el asfalto entre los vehículos.
+    Además se añade dilación antes del closing para conectar fragmentos.
 """
 
 import os
@@ -56,50 +43,40 @@ ROI_TOP_LEFT     = 0.22
 ROI_TOP_RIGHT    = 0.78
 ROI_BOTTOM_LEFT  = 0.00
 ROI_BOTTOM_RIGHT = 1.00
+TOP_EXCLUDE      = 0.43   # fracción superior ignorada (cielo)
 
-# — Zona superior excluida (cielo, señales altas) —
-TOP_EXCLUDE = 0.43
+# — Muestreo adaptivo de carretera —
+ADAPT_TOL_SCALE      = 2.8
+ADAPT_TOL_MIN_DAY    = 20.0
+ADAPT_TOL_MAX_DAY    = 55.0
+ADAPT_TOL_MIN_NIGHT  = 30.0   # más permisivo de noche
+ADAPT_TOL_MAX_NIGHT  = 70.0
+NIGHT_FRAME_THRESH   = 80     # L_avg < 80 → modo noche
 
-# — Muestreo adaptivo —
-# Tolerancia base por canal: max(std_muestra * TOL_SCALE, TOL_MIN)
-ADAPT_TOL_SCALE = 2.8
-ADAPT_TOL_MIN   = 20.0   # tolerancia mínima por canal
-ADAPT_TOL_MAX   = 55.0   # tolerancia máxima por canal
+# — Líneas de carril: umbral adaptivo local —
+ADAPT_BLOCK  = 61    # tamaño de ventana local (debe ser impar)
+ADAPT_C      = -18   # constante: píxel debe superar media local en |C| niveles
+                     # valor negativo → exige píxel MÁS BRILLANTE que vecindad
 
-# — Líneas de carril (umbrales adaptativos según brillo del frame) —
-# Día (L_avg >= 120):  blancas L>200, amarillo S>70
-# Crepúsculo (80-120): blancas L>170, amarillo S>55
-# Noche (< 80):        blancas L>130, amarillo S>40
-LANE_BRIGHT_DAY        = 120   # L_avg del frame — umbral día/crepúsculo
-LANE_BRIGHT_DUSK       = 80    # L_avg del frame — umbral crepúsculo/noche
-WHITE_L_DAY            = 200
-WHITE_L_DUSK           = 170
-WHITE_L_NIGHT          = 130
-YELLOW_H_MIN           = 15
-YELLOW_H_MAX           = 38
-YELLOW_S_DAY           = 70
-YELLOW_S_DUSK          = 55
-YELLOW_S_NIGHT         = 40
-# Sobel: solo píxeles MÁS BRILLANTES que la carretera (filtra vegetación)
-SOBEL_THRESH           = 25    # umbral mínimo de gradiente Sobel-X normalizado
-SOBEL_ROAD_OFFSET      = 22    # píxel debe tener L > road_L_median + este offset
+# Para amarillo se usa detección por color (el adaptivo no discrimina amarillo)
+# pero el S_min se ajusta dinámicamente
+YELLOW_H_MIN = 15
+YELLOW_H_MAX = 38
 
 # — Hough —
-HOUGH_THRESHOLD     = 35
-HOUGH_MIN_LEN       = 40
-HOUGH_MAX_GAP       = 80
-HOUGH_SLOPE_MIN     = 0.25
-HOUGH_LEFT_MAX_MID  = 0.48   # izquierdo: mid_x < 48 %
-HOUGH_RIGHT_MIN_MID = 0.52   # derecho:   mid_x > 52 %
+HOUGH_THRESHOLD     = 30
+HOUGH_MIN_LEN       = 30
+HOUGH_MAX_GAP       = 100
+HOUGH_SLOPE_MIN     = 0.22
+HOUGH_LEFT_MAX_MID  = 0.50
+HOUGH_RIGHT_MIN_MID = 0.50
 
-# — Blob —
-BLOB_MIN_FRAC = 0.004   # tamaño mínimo: 0.4 % del área ROI
-
-OUTPUT_NAMES = ("road", "lanes", "combined")
+BLOB_MIN_FRAC = 0.003
+OUTPUT_NAMES  = ("road", "lanes", "combined")
 
 
 # ---------------------------------------------------------------------------
-# NORMALIZACIÓN DE ILUMINACIÓN
+# NORMALIZACIÓN DE ILUMINACIÓN (CLAHE)
 # ---------------------------------------------------------------------------
 def normalize_lighting(frame):
     clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -127,77 +104,87 @@ def build_roi_mask(h, w):
 
 
 # ---------------------------------------------------------------------------
+# DETECCIÓN DE MODO (día / noche)
+# ---------------------------------------------------------------------------
+def get_brightness(norm):
+    """L promedio del canal L en HLS."""
+    hls = cv2.cvtColor(norm, cv2.COLOR_BGR2HLS)
+    return float(hls[:, :, 1].mean())
+
+
+# ---------------------------------------------------------------------------
 # MUESTREO ADAPTIVO DEL COLOR DE CARRETERA
 # ---------------------------------------------------------------------------
-def sample_road_color(norm):
-    """
-    Muestrea el color del asfalto desde 3 parches en el centro-inferior.
-    Devuelve (mean_bgr, tolerance_bgr) como arrays float32.
-    """
+def sample_road_color(norm, night_mode):
     h, w = norm.shape[:2]
-
     regions = [
-        # (y1_frac, y2_frac, x1_frac, x2_frac)
-        (0.84, 0.94, 0.38, 0.62),   # centro
-        (0.87, 0.95, 0.18, 0.40),   # izquierda
-        (0.87, 0.95, 0.60, 0.82),   # derecha
+        (0.84, 0.94, 0.38, 0.62),
+        (0.87, 0.95, 0.18, 0.40),
+        (0.87, 0.95, 0.60, 0.82),
     ]
-
     means = []
     for y1f, y2f, x1f, x2f in regions:
-        y1, y2 = int(h * y1f), int(h * y2f)
-        x1, x2 = int(w * x1f), int(w * x2f)
-        patch   = norm[y1:y2, x1:x2]
+        patch = norm[int(h*y1f):int(h*y2f), int(w*x1f):int(w*x2f)]
         if patch.size > 0:
-            means.append(patch.mean(axis=(0, 1)).astype(np.float32))
+            means.append(patch.mean(axis=(0,1)).astype(np.float32))
 
     if not means:
-        return np.array([100, 100, 100], dtype=np.float32), \
-               np.array([30, 30, 30],   dtype=np.float32)
+        return np.array([100,100,100], np.float32), np.array([35,35,35], np.float32)
 
-    means      = np.array(means)
-    road_mean  = np.median(means, axis=0)
-    # Tolerancia: dispersión entre parches * escala + mínimo
-    road_std   = means.std(axis=0) if len(means) > 1 else np.zeros(3)
-    tolerance  = np.clip(road_std * ADAPT_TOL_SCALE + ADAPT_TOL_MIN,
-                         ADAPT_TOL_MIN, ADAPT_TOL_MAX)
+    means     = np.array(means)
+    road_mean = np.median(means, axis=0)
+    road_std  = means.std(axis=0) if len(means) > 1 else np.zeros(3)
+
+    if night_mode:
+        tol_min, tol_max = ADAPT_TOL_MIN_NIGHT, ADAPT_TOL_MAX_NIGHT
+    else:
+        tol_min, tol_max = ADAPT_TOL_MIN_DAY, ADAPT_TOL_MAX_DAY
+
+    tolerance = np.clip(road_std * ADAPT_TOL_SCALE + tol_min, tol_min, tol_max)
     return road_mean.astype(np.float32), tolerance.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
-# DETECCIÓN DE SUPERFICIE DE CARRETERA (ADAPTIVA)
+# DETECCIÓN DE SUPERFICIE DE CARRETERA
 # ---------------------------------------------------------------------------
-def detect_road_surface(frame, norm, roi_mask):
-    h, w     = frame.shape[:2]
+def detect_road_surface(norm, roi_mask, night_mode):
+    h, w     = norm.shape[:2]
     roi_area = max(int(roi_mask.sum() / 255), 1)
 
-    # 1. Muestrear color adaptivo de carretera
-    road_mean, tolerance = sample_road_color(norm)
+    road_mean, tolerance = sample_road_color(norm, night_mode)
 
-    # 2. Máscara: píxeles dentro de la tolerancia del color muestreado
-    norm_f = norm.astype(np.float32)
-    diff   = np.abs(norm_f - road_mean)
-    mask   = np.all(diff < tolerance, axis=2).astype(np.uint8) * 255
+    diff = np.abs(norm.astype(np.float32) - road_mean)
+    mask = np.all(diff < tolerance, axis=2).astype(np.uint8) * 255
 
-    # 3. Excluir zona superior y aplicar ROI
     mask[:int(h * TOP_EXCLUDE), :] = 0
     mask = cv2.bitwise_and(mask, mask, mask=roi_mask)
 
-    # 4. Limpieza morfológica
+    # Morfología: más agresiva de noche para unir asfalto entre vehículos
     k5  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    k17 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k5,  iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k17, iterations=3)
+    if night_mode:
+        k_dil   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   k5,     iterations=1)
+        mask = cv2.dilate       (mask, k_dil,            iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,  k_close, iterations=4)
+    else:
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k5,      iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=3)
 
-    # 5. Componentes conectados + votación multi-semilla
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     road = np.zeros_like(mask)
     if n <= 1:
         return road
 
-    seed_ys = [int(h * f) for f in (0.93, 0.86, 0.78)]
+    # Votación multi-semilla
+    if night_mode:
+        seed_ys = [int(h * f) for f in (0.80, 0.87, 0.93)]
+    else:
+        seed_ys = [int(h * f) for f in (0.93, 0.86, 0.78)]
     seed_xs = [int(w * f) for f in (0.50, 0.42, 0.58, 0.33, 0.67)]
-    votes   = {}
+
+    votes = {}
     for sy in seed_ys:
         for sx in seed_xs:
             if not (0 <= sy < h and 0 <= sx < w):
@@ -210,91 +197,68 @@ def detect_road_surface(frame, norm, roi_mask):
             votes[lbl] = votes.get(lbl, 0) + 1
 
     if votes:
-        best_lbl = max(votes, key=votes.get)
-        road[labels == best_lbl] = 255
+        road[labels == max(votes, key=votes.get)] = 255
     else:
-        valid = [
-            (stats[i, cv2.CC_STAT_AREA], i)
-            for i in range(1, n)
-            if stats[i, cv2.CC_STAT_AREA] >= BLOB_MIN_FRAC * roi_area
-        ]
+        valid = [(stats[i, cv2.CC_STAT_AREA], i) for i in range(1, n)
+                 if stats[i, cv2.CC_STAT_AREA] >= BLOB_MIN_FRAC * roi_area]
         if valid:
-            _, best_lbl = max(valid)
-            road[labels == best_lbl] = 255
+            road[labels == max(valid)[1]] = 255
 
     return road
 
 
 # ---------------------------------------------------------------------------
-# DETECCIÓN DE LÍNEAS DE CARRIL  (umbrales adaptativos)
-# Detecta: blancas continuas, blancas discontinuas, amarillas continuas,
-#          amarillas discontinuas — todo dentro de la máscara de carretera.
-#
-# FIX A — POCA LUZ: umbrales de L y S se reducen según brillo promedio
-#          del frame. Noche → L>130, S>40. Crepúsculo → L>170, S>55.
-#
-# FIX B — VEGETACIÓN: el Sobel-X ahora solo acepta píxeles más brillantes
-#          que la mediana del asfalto detectado. Las hojas y el pasto no son
-#          más brillantes que el asfalto → sus bordes quedan descartados.
-#          Además se restringe el amarillo exigiendo que el píxel esté
-#          dentro de la road_mask (vegetación amarilla queda afuera).
+# DETECCIÓN DE LÍNEAS DE CARRIL — UMBRAL ADAPTIVO LOCAL
 # ---------------------------------------------------------------------------
-def detect_lane_lines(norm, road_mask):
+def detect_lane_lines(norm, road_mask, night_mode):
+    """
+    Usa cv2.adaptiveThreshold sobre el canal L (HLS):
+      Cada píxel se compara con la media de su vecindad ADAPT_BLOCK×ADAPT_BLOCK.
+      Si es más brillante por más de |ADAPT_C| → marca vial.
+    Funciona de día y de noche porque la comparación es RELATIVA al entorno.
+
+    El amarillo se detecta por color (H+S) ya que el adaptivo no discrimina tono.
+    Ambas máscaras se confinan a road_mask para eliminar vegetación y señales.
+    """
     hls              = cv2.cvtColor(norm, cv2.COLOR_BGR2HLS)
     h_ch, l_ch, s_ch = cv2.split(hls)
+    hsv              = cv2.cvtColor(norm, cv2.COLOR_BGR2HSV)
+    s_hsv            = hsv[:, :, 1]
 
-    # — FIX A: seleccionar umbrales según brillo promedio del frame —
-    l_avg = float(l_ch.mean())
-    if l_avg >= LANE_BRIGHT_DAY:
-        white_l_min   = WHITE_L_DAY
-        yellow_s_min  = YELLOW_S_DAY
-    elif l_avg >= LANE_BRIGHT_DUSK:
-        white_l_min   = WHITE_L_DUSK
-        yellow_s_min  = YELLOW_S_DUSK
-    else:                                   # noche / poca luz
-        white_l_min   = WHITE_L_NIGHT
-        yellow_s_min  = YELLOW_S_NIGHT
+    # ① Marcas por brillo local relativo (blancas día+noche, amarillas día)
+    adaptive_bright = cv2.adaptiveThreshold(
+        l_ch,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        ADAPT_BLOCK,
+        ADAPT_C        # negativo: requiere ser MÁS brillante que la media
+    )
 
-    # — Marcas blancas —
-    white_mask = cv2.inRange(l_ch, white_l_min, 255)
-
-    # — Marcas amarillas —
+    # ② Marcas amarillas por color (umbral S adaptivo según saturación media)
+    s_mean = float(s_hsv[road_mask == 255].mean()) if road_mask.any() else 50.0
+    # De noche la saturación global baja → bajar el umbral proporcionalmente
+    yellow_s_min = max(30, int(s_mean * 0.55))
     yellow_mask = cv2.inRange(
         hls,
-        np.array([YELLOW_H_MIN, 40,  yellow_s_min]),
+        np.array([YELLOW_H_MIN, 30,  yellow_s_min]),
         np.array([YELLOW_H_MAX, 255, 255])
     )
 
-    # — FIX B: Sobel filtrado por brillo relativo al asfalto —
-    # Calcular mediana de L en la zona de carretera detectada
-    road_pixels = l_ch[road_mask == 255]
-    road_l_med  = float(np.median(road_pixels)) if road_pixels.size > 0 else float(l_avg)
+    # ③ Extraer blancas: brillo adaptivo AND no-amarillo
+    #    (evita que el amarillo pase como "blanco" por ser brillante)
+    not_yellow  = cv2.bitwise_not(yellow_mask)
+    white_mask  = cv2.bitwise_and(adaptive_bright, not_yellow)
 
-    sobel_x   = cv2.Sobel(l_ch, cv2.CV_64F, 1, 0, ksize=3)
-    abs_sobel = np.abs(sobel_x)
-    max_s     = abs_sobel.max()
-    scaled    = (255.0 * abs_sobel / max_s).astype(np.uint8) if max_s > 0 \
-                else np.zeros_like(l_ch)
+    # ④ Combinar
+    combined = cv2.bitwise_or(white_mask, yellow_mask)
 
-    # Solo acepta gradiente donde el píxel es NOTABLEMENTE más brillante
-    # que el asfalto → descarta bordes de vegetación, sombras, muros
-    brighter_than_road = (l_ch.astype(np.int16) > road_l_med + SOBEL_ROAD_OFFSET) \
-                         .astype(np.uint8) * 255
-    grad_mask = cv2.bitwise_and(
-        cv2.inRange(scaled, SOBEL_THRESH, 255),
-        brighter_than_road
-    )
-
-    # — Combinar los 3 criterios —
-    combined = cv2.bitwise_or(white_mask,  yellow_mask)
-    combined = cv2.bitwise_or(combined,    grad_mask)
-
-    # — Confinar a la máscara de carretera —
+    # ⑤ Confinar a carretera → elimina vegetación, señales, edificios
     white_mask  = cv2.bitwise_and(white_mask,  white_mask,  mask=road_mask)
     yellow_mask = cv2.bitwise_and(yellow_mask, yellow_mask, mask=road_mask)
     combined    = cv2.bitwise_and(combined,    combined,    mask=road_mask)
 
-    # Limpieza
+    # ⑥ Limpieza morfológica leve
     k3       = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, k3, iterations=1)
 
@@ -364,8 +328,8 @@ def draw_road_only(frame, road_mask):
 
 def draw_lanes_only(frame, white_mask, yellow_mask, hough_lines):
     out = frame.copy()
-    out[white_mask  == 255] = (255, 200, 60)   # celeste para blancas
-    out[yellow_mask == 255] = (0,   210, 255)  # amarillo para amarillas
+    out[white_mask  == 255] = (255, 200, 60)
+    out[yellow_mask == 255] = (0,   210, 255)
     for (x1, y1, x2, y2) in hough_lines:
         cv2.line(out, (x1, y1), (x2, y2), (0, 0, 220), 3, cv2.LINE_AA)
     return out
@@ -426,11 +390,12 @@ def process_video(input_path, output_dir):
         if not ret:
             break
 
-        frame = cv2.resize(frame, TARGET_SIZE)
-        norm  = normalize_lighting(frame)
+        frame      = cv2.resize(frame, TARGET_SIZE)
+        norm       = normalize_lighting(frame)
+        night_mode = get_brightness(norm) < NIGHT_FRAME_THRESH
 
-        road_mask                       = detect_road_surface(frame, norm, roi_mask)
-        white_mask, yellow_mask, binary = detect_lane_lines(norm, road_mask)
+        road_mask                       = detect_road_surface(norm, roi_mask, night_mode)
+        white_mask, yellow_mask, binary = detect_lane_lines(norm, road_mask, night_mode)
         hough_lines                     = detect_hough_lines(binary, frame.shape)
 
         writers["road"].write(draw_road_only(frame, road_mask))
@@ -439,8 +404,9 @@ def process_video(input_path, output_dir):
 
         frame_idx += 1
         if frame_idx % 50 == 0:
-            pct = frame_idx / total * 100 if total > 0 else 0
-            print(f"    frame {frame_idx}/{total}  ({pct:.0f}%)")
+            pct  = frame_idx / total * 100 if total > 0 else 0
+            mode = "NOCHE" if night_mode else "DÍA  "
+            print(f"    frame {frame_idx}/{total}  ({pct:.0f}%)  [{mode}]")
 
     cap.release()
     for w in writers.values():
