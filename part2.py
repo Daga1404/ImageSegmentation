@@ -33,9 +33,9 @@ TARGET_SIZE  = (640, 360)
 FPS_OVERRIDE = None
 
 # — Superficie de carretera —
-CHROMA_THRESHOLD = 0.12   # distancia máxima al gris neutro en cromaticidad
-BRIGHT_MIN       = 25     # brillo mínimo por canal (descarta sombras ruidosas)
-BRIGHT_MAX       = 220    # brillo máximo (descarta reflejos / cielo)
+CHROMA_THRESHOLD = 0.07   # distancia máxima al gris neutro en cromaticidad
+BRIGHT_MIN       = 40     # brillo mínimo por canal (descarta sombras ruidosas)
+BRIGHT_MAX       = 195    # brillo máximo (descarta reflejos / cielo)
 TOP_EXCLUDE      = 0.40   # ignorar el % superior del frame (cielo / pasos elevados)
 
 # — Líneas de carril (HLS, escala OpenCV: H 0-180, L/S 0-255) —
@@ -44,9 +44,9 @@ YELLOW_H     = (15, 35)
 YELLOW_S_MIN = 90
 
 # — Hough probabilístico —
-HOUGH_THRESHOLD = 25
-HOUGH_MIN_LEN   = 25
-HOUGH_MAX_GAP   = 100
+HOUGH_THRESHOLD = 40
+HOUGH_MIN_LEN   = 40
+HOUGH_MAX_GAP   = 80
 HOUGH_SLOPE_MIN = 0.3     # |pendiente| mínima para considerar una línea de carril
 
 OUTPUT_NAMES = ("road", "lanes", "combined")
@@ -90,9 +90,9 @@ def detect_road_surface(frame):
     mask[:int(h * TOP_EXCLUDE), :] = 0
 
     # 5. Limpieza morfológica
-    k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     k9 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k7, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k5, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k9, iterations=2)
 
     # 6. Conservar ÚNICAMENTE el blob que contiene el punto semilla del centro-inferior.
