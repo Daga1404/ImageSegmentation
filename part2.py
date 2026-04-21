@@ -162,18 +162,12 @@ def detect_road_surface(norm, roi_mask, night_mode):
     mask[:int(h * TOP_EXCLUDE), :] = 0
     mask = cv2.bitwise_and(mask, mask, mask=roi_mask)
 
-    # Morfología: más agresiva de noche para unir asfalto entre vehículos
-    k5  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    if night_mode:
-        k_dil   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   k5,     iterations=1)
-        mask = cv2.dilate       (mask, k_dil,            iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,  k_close, iterations=4)
-    else:
-        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k5,      iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=3)
+    # Limpieza ligera ANTES de etiquetar componentes: sólo OPEN para quitar
+    # ruido puntual. El CLOSE pesado se aplica DESPUÉS de seleccionar el blob
+    # ganador — así no puede construir un puente entre el asfalto y regiones
+    # vecinas de color similar (banqueta, hombro, edificios) antes de la CC.
+    k5   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k5, iterations=1)
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     road = np.zeros_like(mask)
@@ -200,12 +194,29 @@ def detect_road_surface(norm, roi_mask, night_mode):
             votes[lbl] = votes.get(lbl, 0) + 1
 
     if votes:
-        road[labels == max(votes, key=votes.get)] = 255
+        # Aceptar TODOS los componentes con voto: si un vehículo/sombra
+        # parte la carretera en varios fragmentos, las 15 semillas (3×5)
+        # reparten votos entre ellos y se conservan todos los trozos.
+        for lbl in votes:
+            road[labels == lbl] = 255
     else:
         valid = [(stats[i, cv2.CC_STAT_AREA], i) for i in range(1, n)
                  if stats[i, cv2.CC_STAT_AREA] >= BLOB_MIN_FRAC * roi_area]
         if valid:
             road[labels == max(valid)[1]] = 255
+
+    # CLOSE pesado SÓLO sobre el blob ganador: rellena huecos internos
+    # (vehículos, sombras, marcas viales) sin poder filtrar hacia regiones
+    # vecinas porque el resto de la máscara ya está en negro.
+    if road.any():
+        if night_mode:
+            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+            road    = cv2.morphologyEx(road, cv2.MORPH_CLOSE, k_close, iterations=4)
+        else:
+            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            road    = cv2.morphologyEx(road, cv2.MORPH_CLOSE, k_close, iterations=3)
+        # Re-confinar al ROI por si el CLOSE expandió el contorno más allá
+        road = cv2.bitwise_and(road, road, mask=roi_mask)
 
     return road
 
@@ -250,18 +261,22 @@ def detect_lane_lines(norm, road_mask, night_mode):
 
     # ③ Extraer blancas: brillo adaptivo AND no-amarillo
     #    (evita que el amarillo pase como "blanco" por ser brillante)
-    not_yellow  = cv2.bitwise_not(yellow_mask)
-    white_mask  = cv2.bitwise_and(adaptive_bright, not_yellow)
+    white_mask  = cv2.bitwise_and(adaptive_bright, cv2.bitwise_not(yellow_mask))
 
-    # ④ Combinar
+    # ④ Filtrar amarillo: exigir que también sea localmente brillante
+    #    (elimina vegetación/pasto seco que comparte rango de tono amarillo
+    #     pero NO es más brillante que su entorno como lo es una marca vial)
+    yellow_mask = cv2.bitwise_and(yellow_mask, adaptive_bright)
+
+    # ⑤ Combinar
     combined = cv2.bitwise_or(white_mask, yellow_mask)
 
-    # ⑤ Confinar a carretera → elimina vegetación, señales, edificios
+    # ⑥ Confinar a carretera → elimina vegetación, señales, edificios
     white_mask  = cv2.bitwise_and(white_mask,  white_mask,  mask=road_mask)
     yellow_mask = cv2.bitwise_and(yellow_mask, yellow_mask, mask=road_mask)
     combined    = cv2.bitwise_and(combined,    combined,    mask=road_mask)
 
-    # ⑥ Limpieza morfológica leve
+    # ⑦ Limpieza morfológica leve
     k3       = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, k3, iterations=1)
 
